@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-DELETE_DELAY = 124  # 200 seconds
+DELETE_DELAY = 135  # 200 seconds
 
 class TelegramMessageDeleter:
     def __init__(self):
@@ -112,7 +112,7 @@ class TelegramMessageDeleter:
             async def chat_action_handler(event):
                 if event.user_added and await event.get_user() == self.bot_info:
                     creator_text = "🤖 **Thanks for adding me!**\n\n"
-                    creator_text += "This Bot is created by [@itz_fizzyll](https://t.me/itz_fizzyll)\n\n"
+                    creator_text += "This Bot is created by [@uexnc](https://t.me/uexnc)\n\n"
                     creator_text += "I will automatically delete other bot messages "
                     creator_text += f"**{DELETE_DELAY} seconds** after they are sent.\n\n"
                     creator_text += "**Make sure to:**\n"
