@@ -1,14 +1,12 @@
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import Message, ChatMember
-from pyrogram.enums import ChatMemberStatus
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, ChatAdminRequired
 import asyncio
 import logging
 from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN
 import os
 import sys
-import json
-from datetime import datetime
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -18,108 +16,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-DELETE_DELAY = 10  # 135 seconds
-OWNER_ID = 8595518118
+DELETE_DELAY = 10  # seconds
+MAX_RETRIES = 3
 
 class TelegramMessageDeleter:
     def __init__(self):
         self.user_client = None
         self.bot_client = None
         self.bot_info = None
-        self.user_info = None
-        self.running = True
-        self.message_queue = asyncio.Queue(maxsize=1000)
-        self.processed_messages = set()
-        self.active_groups = set()  # Groups where both are admins
-        self.last_admin_check = {}  # Cache admin status
-        self.check_interval = 300  # Check admin status every 5 minutes
-
-    async def check_admin_status(self, chat_id):
-        """Check if both user and bot are admins in the group"""
-        try:
-            # Check current time to avoid too frequent checks
-            current_time = datetime.now().timestamp()
-            if chat_id in self.last_admin_check:
-                if current_time - self.last_admin_check[chat_id] < self.check_interval:
-                    return chat_id in self.active_groups
-            
-            self.last_admin_check[chat_id] = current_time
-            
-            # Get chat members
-            try:
-                # Check bot admin status
-                bot_member = await self.bot_client.get_chat_member(chat_id, self.bot_info.id)
-                bot_is_admin = bot_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
-                
-                # Check user account admin status
-                user_member = await self.user_client.get_chat_member(chat_id, self.user_info.id)
-                user_is_admin = user_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
-                
-                # Check if both have delete permissions
-                bot_can_delete = True
-                if bot_is_admin and bot_member.privileges:
-                    bot_can_delete = bot_member.privileges.can_delete_messages
-                
-                user_can_delete = True
-                if user_is_admin and user_member.privileges:
-                    user_can_delete = user_member.privileges.can_delete_messages
-                
-                if bot_is_admin and user_is_admin and bot_can_delete and user_can_delete:
-                    if chat_id not in self.active_groups:
-                        self.active_groups.add(chat_id)
-                        logger.info(f"✅ Both are admins in chat {chat_id} - Bot will now delete messages")
-                    return True
-                else:
-                    if chat_id in self.active_groups:
-                        self.active_groups.discard(chat_id)
-                        logger.warning(f"⚠️ Lost admin permissions in chat {chat_id}")
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"Error checking admin status in {chat_id}: {e}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Admin check error: {e}")
-            return False
-
-    async def is_owner(self, user_id):
-        """Check if user is owner"""
-        return user_id == OWNER_ID
-
-    async def delete_message_worker(self):
-        """Worker to handle message deletion with delay"""
-        while self.running:
-            try:
-                message, chat_id, sender_name, message_id = await self.message_queue.get()
-                
-                if message_id in self.processed_messages:
-                    continue
-                    
-                self.processed_messages.add(message_id)
-                
-                if len(self.processed_messages) > 10000:
-                    self.processed_messages.clear()
-                
-                await asyncio.sleep(DELETE_DELAY)
-                
-                try:
-                    # Check if still admin before deleting
-                    if await self.check_admin_status(chat_id):
-                        await message.delete()
-                        logger.info(f"✅ Deleted bot message from {sender_name} in {chat_id}")
-                    else:
-                        logger.warning(f"⚠️ Cannot delete - lost admin rights in {chat_id}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to delete message: {e}")
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in delete worker: {e}")
+        self.deletion_queue = asyncio.Queue()
+        self.is_running = True
 
     async def start_user_client(self):
-        """Start the user client"""
+        """Start the user client using string session"""
         try:
             logger.info("🔄 Starting user client...")
             
@@ -128,84 +37,49 @@ class TelegramMessageDeleter:
                 api_id=API_ID,
                 api_hash=API_HASH,
                 session_string=SESSION_STRING,
-                workdir=".",
-                in_memory=False,
-                max_concurrent_transmissions=20,
-                sleep_threshold=60
+                in_memory=True
             )
             
             await self.user_client.start()
-            self.user_info = await self.user_client.get_me()
-            logger.info(f"✅ User client started: {self.user_info.first_name} (ID: {self.user_info.id})")
+            user_me = await self.user_client.get_me()
+            logger.info(f"✅ User client started successfully: {user_me.first_name} (ID: {user_me.id})")
             
-            @self.user_client.on_message(filters.group & filters.bot)
-            async def handler(client, message: Message):
+            # Register message handler
+            @self.user_client.on_message()
+            async def message_handler(client: Client, message: Message):
                 try:
-                    chat_id = message.chat.id
-                    
-                    # Check if both are admins
-                    if not await self.check_admin_status(chat_id):
+                    # Ignore if no sender or not a group/channel
+                    if not message.from_user or not message.chat:
                         return
                     
-                    # Don't delete our own bot's messages
-                    if self.bot_info and message.from_user.id == self.bot_info.id:
+                    # Check if it's a group or supergroup
+                    chat_type = message.chat.type
+                    if chat_type not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
                         return
                     
-                    # Generate unique message ID
-                    message_id = f"{chat_id}_{message.id}"
-                    
-                    if message_id in self.processed_messages:
-                        return
-                    
-                    bot_name = message.from_user.first_name if message.from_user else "Unknown"
-                    logger.info(f"🤖 Bot message from {bot_name} (ID: {message.from_user.id}) in chat {chat_id}")
-                    
-                    if message.text:
-                        logger.info(f"📝 Message: {message.text[:100]}")
-                    else:
-                        logger.info(f"📝 Media message")
-                    
-                    await self.message_queue.put((message, chat_id, bot_name, message_id))
-                    
+                    # Check if message is from a bot and not from our own bot
+                    if (message.from_user.is_bot and 
+                        self.bot_info and 
+                        message.from_user.id != self.bot_info.id):
+                        
+                        logger.info(f"🤖 Bot message detected from {message.from_user.first_name} (ID: {message.from_user.id})")
+                        logger.info(f"📝 Chat: {message.chat.title} (ID: {message.chat.id})")
+                        logger.info(f"📝 Message: {message.text[:100] if message.text else 'Media message'}")
+                        logger.info(f"⏰ Will delete in {DELETE_DELAY} seconds...")
+                        
+                        # Add to deletion queue
+                        await self.deletion_queue.put({
+                            'chat_id': message.chat.id,
+                            'message_id': message.id,
+                            'delay': DELETE_DELAY,
+                            'retries': 0
+                        })
+                            
                 except FloodWait as e:
-                    logger.warning(f"Flood wait {e.value}s - waiting...")
+                    logger.warning(f"⏳ Flood wait in handler: {e.value} seconds")
                     await asyncio.sleep(e.value)
                 except Exception as e:
-                    logger.error(f"Handler error: {e}")
-            
-            # Also handle when bot is added to group
-            @self.user_client.on_message(filters.group & filters.new_chat_members)
-            async def member_add_handler(client, message: Message):
-                try:
-                    for member in message.new_chat_members:
-                        if member.id == self.bot_info.id:
-                            chat_id = message.chat.id
-                            logger.info(f"🤖 Bot added to group {chat_id}")
-                            # Check admin status after a few seconds
-                            await asyncio.sleep(5)
-                            if await self.check_admin_status(chat_id):
-                                await message.reply(
-                                    f"✅ **Bot is ready!**\n\n"
-                                    f"I will automatically delete messages from other bots in this group.\n\n"
-                                    f"**Requirements met:**\n"
-                                    f"✓ Bot is admin\n"
-                                    f"✓ User account is admin\n"
-                                    f"✓ Delete permissions enabled\n\n"
-                                    f"⏰ Messages will be deleted after {DELETE_DELAY} seconds.\n\n"
-                                    f"👨‍💻 Created by @itz_fizzyll"
-                                )
-                            else:
-                                await message.reply(
-                                    f"⚠️ **Cannot start monitoring!**\n\n"
-                                    f"Please ensure:\n"
-                                    f"1. Bot is promoted as admin\n"
-                                    f"2. User account (@{self.user_info.username}) is promoted as admin\n"
-                                    f"3. Both have 'Delete Messages' permission\n\n"
-                                    f"After promoting, I will automatically start working."
-                                )
-                            break
-                except Exception as e:
-                    logger.error(f"Member add handler error: {e}")
+                    logger.error(f"Error in message handler: {e}")
 
             return True
             
@@ -219,106 +93,52 @@ class TelegramMessageDeleter:
         """Start the bot client"""
         try:
             logger.info("🔄 Starting bot client...")
-            
             self.bot_client = Client(
                 name="bot_session",
                 api_id=API_ID,
                 api_hash=API_HASH,
                 bot_token=BOT_TOKEN,
-                workdir=".",
-                max_concurrent_transmissions=20,
-                sleep_threshold=60
+                in_memory=True
             )
             
             await self.bot_client.start()
             self.bot_info = await self.bot_client.get_me()
-            logger.info(f"✅ Bot started: {self.bot_info.first_name} (@{self.bot_info.username})")
+            logger.info(f"✅ Bot client started: {self.bot_info.first_name} (@{self.bot_info.username})")
             
-            # Owner commands only
-            @self.bot_client.on_message(filters.command("start") & filters.private)
-            async def start_cmd(client, message: Message):
-                if not await self.is_owner(message.from_user.id):
-                    await message.reply("❌ Unauthorized user!")
-                    return
+            # Add start command handler with creator credit
+            @self.bot_client.on_message(filters.command("start"))
+            async def start_handler(client: Client, message: Message):
+                creator_text = "🤖 **Bot Message Deleter**\n\n"
+                creator_text += "This Bot is created by [@itz_fizzyll](https://t.me/itz_fizzyll)\n\n"
+                creator_text += "**Features:**\n"
+                creator_text += "• Automatically detects bot messages\n"
+                creator_text += f"• Deletes messages after {DELETE_DELAY} seconds\n"
+                creator_text += "• Works in groups where I'm admin\n"
+                creator_text += "• Monitors all bot activities\n\n"
+                creator_text += "**Requirements:**\n"
+                creator_text += "• Bot must be admin with delete permissions\n"
+                creator_text += "• User account must be admin with delete permissions\n\n"
+                creator_text += "🚀 *Bot is now running and monitoring...*"
                 
-                text = f"""🤖 **Bot Message Deleter - Active!**
-
-**Status:** ✅ Running
-**Groups Active:** {len(self.active_groups)}
-**Delete Delay:** {DELETE_DELAY} seconds
-**Library:** Pyrogram (Optimized)
-
-**How it works:**
-1. Add bot to any group
-2. Promote bot as admin with delete permissions
-3. Promote user account (@{self.user_info.username}) as admin
-4. Bot automatically detects and deletes bot messages
-
-**Commands:**
-/status - Check bot status
-/stats - View performance stats
-
-**Note:** No approval needed! Bot works automatically where both are admins.
-
-👨‍💻 Created by @itz_fizzyll"""
-                
-                await message.reply(text, disable_web_page_preview=True)
+                await message.reply_text(creator_text, disable_web_page_preview=True)
             
-            @self.bot_client.on_message(filters.command("status") & filters.private)
-            async def status_cmd(client, message: Message):
-                if not await self.is_owner(message.from_user.id):
-                    return
-                
-                # Update admin status for all groups
-                active_count = 0
-                for chat_id in list(self.active_groups):
-                    if await self.check_admin_status(chat_id):
-                        active_count += 1
-                
-                status_text = f"""**📊 Bot Status Report**
-
-**General:**
-✅ Status: Running
-👑 Owner: `{OWNER_ID}`
-⏰ Delete delay: {DELETE_DELAY}s
-
-**Performance:**
-📊 Active groups: {len(self.active_groups)}
-🔄 Queue size: {self.message_queue.qsize()}
-💾 Cache size: {len(self.processed_messages)}
-
-**Account Info:**
-🤖 Bot: @{self.bot_info.username}
-👤 User: @{self.user_info.username}
-
-**Requirements:**
-• Bot must be admin ✓
-• User must be admin ✓
-• Delete permissions ✓
-
-Bot works automatically in any group where both accounts are admins!"""
-                
-                await message.reply(status_text)
-            
-            @self.bot_client.on_message(filters.command("stats") & filters.private)
-            async def stats_cmd(client, message: Message):
-                if not await self.is_owner(message.from_user.id):
-                    return
-                
-                stats_text = f"""**📈 Performance Statistics**
-
-**Active Groups:** {len(self.active_groups)}
-**Queue Size:** {self.message_queue.qsize()}
-**Processed Messages:** {len(self.processed_messages)}
-**Delete Delay:** {DELETE_DELAY}s
-
-**System Info:**
-**Library:** Pyrogram 2.0.106
-**Host:** Heroku
-
-Bot is actively monitoring all groups where both accounts are admins."""
-                
-                await message.reply(stats_text)
+            # Handle new chat members (when bot is added)
+            @self.bot_client.on_message(filters.new_chat_members)
+            async def bot_added_handler(client: Client, message: Message):
+                for member in message.new_chat_members:
+                    if member.id == self.bot_info.id:
+                        creator_text = "🤖 **Thanks for adding me!**\n\n"
+                        creator_text += "This Bot is created by [@uexnc](https://t.me/uexnc)\n\n"
+                        creator_text += "I will automatically delete other bot messages "
+                        creator_text += f"**{DELETE_DELAY} seconds** after they are sent.\n\n"
+                        creator_text += "**Make sure to:**\n"
+                        creator_text += "1. Promote me as admin\n"
+                        creator_text += "2. Give me 'Delete Messages' permission\n"
+                        creator_text += "3. Also promote the user account as admin\n\n"
+                        creator_text += "Use /start to check my status"
+                        
+                        await message.reply_text(creator_text, disable_web_page_preview=True)
+                        break
 
             return True
             
@@ -328,110 +148,133 @@ Bot is actively monitoring all groups where both accounts are admins."""
             logger.error(traceback.format_exc())
             return False
 
-    async def keep_alive(self):
-        """Keep the bot alive and monitor performance"""
-        last_log = datetime.now()
-        
-        while self.running:
+    async def process_deletion_queue(self):
+        """Process queued message deletions"""
+        while self.is_running:
             try:
-                await asyncio.sleep(60)
+                # Get deletion task from queue
+                task = await self.deletion_queue.get()
                 
-                # Log status every 5 minutes
-                if (datetime.now() - last_log).seconds >= 300:
-                    logger.info(f"💓 Heartbeat - Active Groups: {len(self.active_groups)} | Queue: {self.message_queue.qsize()} | Cache: {len(self.processed_messages)}")
-                    last_log = datetime.now()
+                # Wait for the specified delay
+                await asyncio.sleep(task['delay'])
                 
-                # Clear cache if too large
-                if len(self.processed_messages) > 20000:
-                    self.processed_messages.clear()
-                    logger.info("Cache automatically cleared")
-                
-                # Periodically recheck admin status for all groups
-                if int(datetime.now().timestamp()) % 1800 < 60:  # Every 30 minutes
-                    for chat_id in list(self.active_groups):
-                        await self.check_admin_status(chat_id)
-                
-                # Check connections
-                if self.user_client and not self.user_client.is_connected:
-                    logger.warning("⚠️ User client disconnected! Reconnecting...")
-                    await self.user_client.reconnect()
-                
-                if self.bot_client and not self.bot_client.is_connected:
-                    logger.warning("⚠️ Bot client disconnected! Reconnecting...")
-                    await self.bot_client.reconnect()
+                # Try to delete the message
+                try:
+                    await self.user_client.delete_messages(
+                        chat_id=task['chat_id'],
+                        message_ids=task['message_id']
+                    )
+                    logger.info(f"✅ Successfully deleted message {task['message_id']} from chat {task['chat_id']}")
                     
+                except FloodWait as e:
+                    logger.warning(f"⏳ Flood wait for {e.value} seconds, retrying...")
+                    if task['retries'] < MAX_RETRIES:
+                        task['retries'] += 1
+                        task['delay'] = e.value  # Wait for flood wait time
+                        await self.deletion_queue.put(task)
+                    else:
+                        logger.error(f"❌ Failed to delete message after {MAX_RETRIES} retries")
+                        
+                except ChatAdminRequired:
+                    logger.error(f"❌ Admin rights required to delete message in chat {task['chat_id']}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Failed to delete message: {e}")
+                    
+                finally:
+                    self.deletion_queue.task_done()
+                    
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Keep-alive error: {e}")
+                logger.error(f"Error in deletion queue processor: {e}")
+
+    async def check_connections(self):
+        """Check if both clients are connected properly"""
+        try:
+            if self.user_client and self.bot_client:
+                user_me = await self.user_client.get_me()
+                bot_me = await self.bot_client.get_me()
+                
+                logger.info(f"🔗 User account: {user_me.first_name} (@{user_me.username})")
+                logger.info(f"🔗 Bot account: {bot_me.first_name} (@{bot_me.username})")
+                logger.info("✅ Both clients are connected and ready!")
+                return True
+        except Exception as e:
+            logger.error(f"❌ Connection check failed: {e}")
+            return False
 
     async def run(self):
         """Run both clients"""
         try:
-            if not await self.start_bot_client():
+            # Start bot client first
+            bot_started = await self.start_bot_client()
+            if not bot_started:
+                logger.error("❌ Failed to start bot client")
+                return
+                
+            # Start user client
+            user_started = await self.start_user_client()
+            if not user_started:
+                logger.error("❌ Failed to start user client")
                 return
             
-            if not await self.start_user_client():
-                return
-            
-            # Start workers
-            delete_worker = asyncio.create_task(self.delete_message_worker())
-            keep_alive_task = asyncio.create_task(self.keep_alive())
-            
-            logger.info("🚀 **Bot Message Deleter is RUNNING!**")
-            logger.info("⚡ Mode: Automatic - Works where both are admins")
-            logger.info(f"⏰ Deletion delay: {DELETE_DELAY} seconds")
-            logger.info(f"🤖 Bot: @{self.bot_info.username}")
-            logger.info(f"👤 User: @{self.user_info.username}")
-            logger.info("👨‍💻 Created by @itz_fizzyll")
-            
-            # Run both clients
-            await asyncio.gather(
-                self.user_client.run(),
-                self.bot_client.run(),
-                delete_worker,
-                keep_alive_task
-            )
+            if await self.check_connections():
+                logger.info("🚀 Bot Message Deleter is now running!")
+                logger.info("📝 Monitoring for bot messages...")
+                logger.info(f"⏰ Bot messages will be deleted after {DELETE_DELAY} seconds")
+                logger.info("👨‍💻 Created by @itz_fizzyll")
+                
+                # Start deletion queue processor
+                queue_task = asyncio.create_task(self.process_deletion_queue())
+                
+                # Keep both clients running
+                while self.is_running:
+                    try:
+                        await asyncio.sleep(1)
+                    except KeyboardInterrupt:
+                        break
+                
+                # Cleanup
+                self.is_running = False
+                queue_task.cancel()
+                
+            else:
+                logger.error("❌ Failed to establish connections")
                 
         except Exception as e:
-            logger.error(f"Fatal error: {e}")
+            logger.error(f"❌ Fatal error: {e}")
             import traceback
             logger.error(traceback.format_exc())
         finally:
-            self.running = False
-            if self.user_client:
-                await self.user_client.stop()
-            if self.bot_client:
-                await self.bot_client.stop()
+            # Cleanup
+            logger.info("🔄 Disconnecting clients...")
+            try:
+                if self.user_client:
+                    await self.user_client.stop()
+                if self.bot_client:
+                    await self.bot_client.stop()
+            except:
+                pass
 
 async def main():
-    """Main function with auto-restart"""
-    restart_count = 0
-    
-    while True:
-        try:
-            deleter = TelegramMessageDeleter()
-            await deleter.run()
-            
-            restart_count += 1
-            logger.warning(f"⚠️ Bot stopped! Restart #{restart_count} in 10 seconds...")
-            await asyncio.sleep(10)
-            
-        except KeyboardInterrupt:
-            logger.info("⏹️ Bot stopped by user")
-            break
-        except Exception as e:
-            logger.error(f"❌ Critical error: {e}")
-            logger.info("Restarting in 30 seconds...")
-            await asyncio.sleep(30)
+    """Main async function to run the bot"""
+    deleter = TelegramMessageDeleter()
+    await deleter.run()
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting Telegram Bot Message Deleter on Heroku...")
-    logger.info("⚡ Mode: Automatic - Works in all groups where both are admins")
+    # For Heroku - simple execution
+    logger.info("🚀 Starting Telegram Bot Message Deleter...")
+    logger.info(f"⏰ Deletion delay set to: {DELETE_DELAY} seconds")
     logger.info("👨‍💻 Created by @itz_fizzyll")
     
     try:
+        # Run the bot
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped")
+        logger.info("⏹️ Bot stopped by user")
     except Exception as e:
-        logger.error(f"Critical error: {e}")
+        logger.error(f"❌ Critical error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         sys.exit(1)
