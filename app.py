@@ -1,12 +1,12 @@
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait, RPCError
 import asyncio
 import logging
 from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN
 import os
 import sys
 import json
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -27,8 +27,7 @@ class TelegramMessageDeleter:
         self.bot_info = None
         self.approved_groups = self.load_approved_groups()
         self.running = True
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10
+        self.message_queue = asyncio.Queue()
 
     def load_approved_groups(self):
         """Load approved groups from file"""
@@ -53,64 +52,61 @@ class TelegramMessageDeleter:
         """Check if user is owner"""
         return user_id == OWNER_ID
 
+    async def delete_message_worker(self):
+        """Worker to handle message deletion with delay"""
+        while self.running:
+            try:
+                message, chat_id, sender_name = await self.message_queue.get()
+                await asyncio.sleep(DELETE_DELAY)
+                try:
+                    await message.delete()
+                    logger.info(f"✅ Deleted bot message from {sender_name}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to delete message: {e}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in delete worker: {e}")
+
     async def start_user_client(self):
-        """Start the user client with auto-reconnect"""
+        """Start the user client"""
         try:
             logger.info("🔄 Starting user client...")
             
-            # Create session from string
-            session = StringSession(SESSION_STRING)
-            
-            self.user_client = TelegramClient(
-                session=session,
+            self.user_client = Client(
+                name="user_session",
                 api_id=API_ID,
                 api_hash=API_HASH,
-                connection_retries=None,
-                retry_delay=5
+                session_string=SESSION_STRING,
+                workdir=".",
+                in_memory=False,
+                max_concurrent_transmissions=10
             )
             
             await self.user_client.start()
             user_me = await self.user_client.get_me()
-            logger.info(f"✅ User client started successfully: {user_me.first_name}")
+            logger.info(f"✅ User client started: {user_me.first_name}")
             
-            @self.user_client.on(events.NewMessage())
-            async def handler(event):
+            @self.user_client.on_message(filters.group & filters.bot)
+            async def handler(client, message: Message):
                 try:
-                    # Check if message is from a chat (group/channel)
-                    if not event.is_group:
-                        return
+                    chat_id = message.chat.id
                     
-                    # Get chat ID
-                    chat_id = event.chat_id
-                    
-                    # Check if chat is approved
                     if chat_id not in self.approved_groups:
                         return
                     
-                    # Ignore if no sender
-                    if not event.sender:
+                    if self.bot_info and message.from_user.id == self.bot_info.id:
                         return
                     
-                    # Check if message is from a bot and not from our own bot
-                    if (event.sender.bot and 
-                        self.bot_info and 
-                        event.sender.id != self.bot_info.id):
-                        
-                        logger.info(f"🤖 Bot message detected from {event.sender.first_name} (ID: {event.sender.id}) in chat {chat_id}")
-                        logger.info(f"📝 Message: {event.text[:100] if event.text else 'Media message'}")
-                        logger.info(f"⏰ Will delete in {DELETE_DELAY} seconds...")
-                        
-                        # Wait DELETE_DELAY seconds then delete
-                        await asyncio.sleep(DELETE_DELAY)
-                        
-                        try:
-                            await event.delete()
-                            logger.info(f"✅ Successfully deleted bot message from {event.sender.first_name} after {DELETE_DELAY} seconds")
-                        except Exception as delete_error:
-                            logger.error(f"❌ Failed to delete message: {delete_error}")
-                            
+                    bot_name = message.from_user.first_name if message.from_user else "Unknown"
+                    logger.info(f"🤖 Bot message from {bot_name} in chat {chat_id}")
+                    
+                    await self.message_queue.put((message, chat_id, bot_name))
+                    
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
                 except Exception as e:
-                    logger.error(f"Error in message handler: {e}")
+                    logger.error(f"Handler error: {e}")
 
             return True
             
@@ -119,151 +115,119 @@ class TelegramMessageDeleter:
             return False
 
     async def start_bot_client(self):
-        """Start the bot client with auto-reconnect"""
+        """Start the bot client"""
         try:
             logger.info("🔄 Starting bot client...")
-            self.bot_client = TelegramClient(
-                session='bot_session',
-                api_id=API_ID, 
+            
+            self.bot_client = Client(
+                name="bot_session",
+                api_id=API_ID,
                 api_hash=API_HASH,
-                connection_retries=None,
-                retry_delay=5
+                bot_token=BOT_TOKEN,
+                workdir=".",
+                max_concurrent_transmissions=10
             )
             
-            await self.bot_client.start(bot_token=BOT_TOKEN)
+            await self.bot_client.start()
             self.bot_info = await self.bot_client.get_me()
-            logger.info(f"✅ Bot client started: {self.bot_info.first_name} (@{self.bot_info.username})")
+            logger.info(f"✅ Bot started: {self.bot_info.first_name}")
             
-            # Add start command handler
-            @self.bot_client.on(events.NewMessage(pattern='/start'))
-            async def start_handler(event):
-                if not await self.is_owner(event.sender_id):
-                    await event.reply("❌ You are not authorized to use this bot.")
+            @self.bot_client.on_message(filters.command("start") & filters.private)
+            async def start_cmd(client, message: Message):
+                if not await self.is_owner(message.from_user.id):
+                    await message.reply("❌ Unauthorized")
                     return
                 
-                creator_text = "🤖 **Bot Message Deleter**\n\n"
-                creator_text += "This Bot is created by [@itz_fizzyll](https://t.me/itz_fizzyll)\n\n"
-                creator_text += "**Commands for Owner:**\n"
-                creator_text += "• `/approve <group_id>` - Approve a group for monitoring\n"
-                creator_text += "• `/unapprove <group_id>` - Remove group from monitoring\n"
-                creator_text += "• `/list` - List all approved groups\n"
-                creator_text += "• `/status` - Check bot status\n\n"
-                creator_text += "**Features:**\n"
-                creator_text += "• Automatically detects bot messages\n"
-                creator_text += f"• Deletes messages after {DELETE_DELAY} seconds\n"
-                creator_text += "• Works only in approved groups\n"
-                creator_text += "• Monitors all bot activities\n\n"
-                creator_text += f"**Approved Groups:** {len(self.approved_groups)}\n\n"
-                creator_text += "🚀 *Bot is now running and monitoring...*"
+                text = f"""🤖 **Bot Message Deleter**
+
+**Commands:**
+/approve <id> - Approve group
+/unapprove <id> - Remove group
+/list - List approved groups
+/status - Bot status
+
+**Features:**
+• Deletes bot messages after {DELETE_DELAY}s
+• Optimized for large groups
+• Auto-restart on failure
+
+**Approved Groups:** {len(self.approved_groups)}
+
+👨‍💻 Created by @itz_fizzyll"""
                 
-                await event.reply(creator_text, link_preview=False)
+                await message.reply(text)
             
-            # Approve group command
-            @self.bot_client.on(events.NewMessage(pattern='/approve'))
-            async def approve_handler(event):
-                if not await self.is_owner(event.sender_id):
-                    await event.reply("❌ You are not authorized to use this command.")
+            @self.bot_client.on_message(filters.command("approve") & filters.private)
+            async def approve_cmd(client, message: Message):
+                if not await self.is_owner(message.from_user.id):
                     return
                 
                 try:
-                    args = event.text.split()
+                    args = message.text.split()
                     if len(args) < 2:
-                        await event.reply("❌ Usage: /approve <group_id>\n\nExample: /approve -1001234567890")
+                        await message.reply("Usage: /approve -1001234567890")
                         return
                     
                     group_id = int(args[1])
                     self.approved_groups.add(group_id)
                     self.save_approved_groups()
+                    await message.reply(f"✅ Group {group_id} approved!")
+                    logger.info(f"Group {group_id} approved")
                     
-                    await event.reply(f"✅ Group {group_id} has been approved!\n\nBot will now monitor and delete bot messages in this group.")
-                    logger.info(f"Group {group_id} approved by owner")
-                    
-                except ValueError:
-                    await event.reply("❌ Invalid group ID. Please provide a valid numeric ID.")
                 except Exception as e:
-                    await event.reply(f"❌ Error: {str(e)}")
+                    await message.reply(f"Error: {str(e)}")
             
-            # Unapprove group command
-            @self.bot_client.on(events.NewMessage(pattern='/unapprove'))
-            async def unapprove_handler(event):
-                if not await self.is_owner(event.sender_id):
-                    await event.reply("❌ You are not authorized to use this command.")
+            @self.bot_client.on_message(filters.command("unapprove") & filters.private)
+            async def unapprove_cmd(client, message: Message):
+                if not await self.is_owner(message.from_user.id):
                     return
                 
                 try:
-                    args = event.text.split()
+                    args = message.text.split()
                     if len(args) < 2:
-                        await event.reply("❌ Usage: /unapprove <group_id>\n\nExample: /unapprove -1001234567890")
+                        await message.reply("Usage: /unapprove -1001234567890")
                         return
                     
                     group_id = int(args[1])
                     if group_id in self.approved_groups:
                         self.approved_groups.remove(group_id)
                         self.save_approved_groups()
-                        await event.reply(f"✅ Group {group_id} has been removed from monitoring.")
-                        logger.info(f"Group {group_id} unapproved by owner")
+                        await message.reply(f"✅ Group {group_id} removed!")
+                        logger.info(f"Group {group_id} unapproved")
                     else:
-                        await event.reply(f"❌ Group {group_id} is not in the approved list.")
+                        await message.reply(f"Group {group_id} not approved")
                     
-                except ValueError:
-                    await event.reply("❌ Invalid group ID. Please provide a valid numeric ID.")
                 except Exception as e:
-                    await event.reply(f"❌ Error: {str(e)}")
+                    await message.reply(f"Error: {str(e)}")
             
-            # List approved groups
-            @self.bot_client.on(events.NewMessage(pattern='/list'))
-            async def list_handler(event):
-                if not await self.is_owner(event.sender_id):
-                    await event.reply("❌ You are not authorized to use this command.")
+            @self.bot_client.on_message(filters.command("list") & filters.private)
+            async def list_cmd(client, message: Message):
+                if not await self.is_owner(message.from_user.id):
                     return
                 
                 if not self.approved_groups:
-                    await event.reply("📋 No groups are currently approved.\n\nUse /approve <group_id> to add a group.")
+                    await message.reply("No approved groups")
                 else:
-                    groups_list = "\n".join([f"• `{group_id}`" for group_id in self.approved_groups])
-                    await event.reply(f"📋 **Approved Groups ({len(self.approved_groups)}):**\n\n{groups_list}")
+                    groups = "\n".join([f"• `{gid}`" for gid in self.approved_groups])
+                    await message.reply(f"**Approved Groups:**\n\n{groups}")
             
-            # Status command
-            @self.bot_client.on(events.NewMessage(pattern='/status'))
-            async def status_handler(event):
-                if not await self.is_owner(event.sender_id):
-                    await event.reply("❌ You are not authorized to use this command.")
+            @self.bot_client.on_message(filters.command("status") & filters.private)
+            async def status_cmd(client, message: Message):
+                if not await self.is_owner(message.from_user.id):
                     return
                 
-                status_text = f"**Bot Status:**\n\n"
-                status_text += f"✅ Bot is running\n"
-                status_text += f"📊 Approved groups: {len(self.approved_groups)}\n"
-                status_text += f"⏰ Deletion delay: {DELETE_DELAY} seconds\n"
-                status_text += f"🤖 Bot username: @{self.bot_info.username}\n"
-                status_text += f"🔄 Reconnect attempts: {self.reconnect_attempts}\n"
-                status_text += f"📅 Uptime: Active\n\n"
-                status_text += "**Commands:**\n"
-                status_text += "/start - Show bot info\n"
-                status_text += "/approve <id> - Approve group\n"
-                status_text += "/unapprove <id> - Remove group\n"
-                status_text += "/list - Show approved groups\n"
-                status_text += "/status - Show this status"
+                status = f"""**Bot Status:**
+
+✅ Running
+📊 Groups: {len(self.approved_groups)}
+⏰ Delay: {DELETE_DELAY}s
+👑 Owner: {OWNER_ID}
+⚡ Optimized for large groups
+
+**System:** Heroku
+**Library:** Pyrogram"""
                 
-                await event.reply(status_text)
-            
-            # Handle bot being added to groups
-            @self.bot_client.on(events.ChatAction())
-            async def chat_action_handler(event):
-                if event.user_added and await event.get_user() == self.bot_info:
-                    chat_id = event.chat_id
-                    chat_title = event.chat.title if event.chat.title else "Unknown"
-                    
-                    creator_text = f"🤖 **Thanks for adding me to {chat_title}!**\n\n"
-                    creator_text += "This Bot is created by [@itz_fizzyll](https://t.me/itz_fizzyll)\n\n"
-                    creator_text += "⚠️ **This group is not approved yet!**\n\n"
-                    creator_text += "The bot owner needs to approve this group using:\n"
-                    creator_text += f"`/approve {chat_id}`\n\n"
-                    creator_text += "**Requirements:**\n"
-                    creator_text += "• Bot must be admin with delete permissions\n"
-                    creator_text += "• User account must be admin with delete permissions\n\n"
-                    creator_text += "Contact @itz_fizzyll to get this group approved."
-                    
-                    await event.reply(creator_text, link_preview=False)
+                await message.reply(status)
 
             return True
             
@@ -271,138 +235,58 @@ class TelegramMessageDeleter:
             logger.error(f"❌ Failed to start bot client: {e}")
             return False
 
-    async def keep_alive(self):
-        """Keep the connection alive with periodic checks"""
-        while self.running:
-            try:
-                await asyncio.sleep(300)  # Check every 5 minutes
-                
-                # Check if user client is still connected
-                if self.user_client and not self.user_client.is_connected():
-                    logger.warning("⚠️ User client disconnected, attempting to reconnect...")
-                    await self.reconnect_user_client()
-                
-                # Check if bot client is still connected
-                if self.bot_client and not self.bot_client.is_connected():
-                    logger.warning("⚠️ Bot client disconnected, attempting to reconnect...")
-                    await self.reconnect_bot_client()
-                
-                # Log status every hour
-                if int(asyncio.get_event_loop().time()) % 3600 < 300:
-                    logger.info(f"💓 Bot is alive - Monitoring {len(self.approved_groups)} approved groups")
-                    
-            except Exception as e:
-                logger.error(f"Error in keep_alive: {e}")
-                await asyncio.sleep(60)  # Wait a minute before retrying
-
-    async def reconnect_user_client(self):
-        """Reconnect user client"""
-        try:
-            if self.user_client:
-                await self.user_client.disconnect()
-            
-            await self.start_user_client()
-            self.reconnect_attempts = 0
-            logger.info("✅ User client reconnected successfully")
-        except Exception as e:
-            self.reconnect_attempts += 1
-            logger.error(f"❌ Failed to reconnect user client (Attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}): {e}")
-            
-            if self.reconnect_attempts >= self.max_reconnect_attempts:
-                logger.critical("Max reconnection attempts reached. Please restart the bot.")
-                self.running = False
-
-    async def reconnect_bot_client(self):
-        """Reconnect bot client"""
-        try:
-            if self.bot_client:
-                await self.bot_client.disconnect()
-            
-            await self.start_bot_client()
-            logger.info("✅ Bot client reconnected successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to reconnect bot client: {e}")
-
     async def run(self):
-        """Run both clients with keep-alive"""
+        """Run both clients"""
         try:
-            # Start bot client first
-            bot_started = await self.start_bot_client()
-            if not bot_started:
-                logger.error("❌ Failed to start bot client")
-                return
-                
-            # Start user client
-            user_started = await self.start_user_client()
-            if not user_started:
-                logger.error("❌ Failed to start user client")
+            if not await self.start_bot_client():
                 return
             
-            logger.info("🚀 Bot Message Deleter is now running!")
-            logger.info(f"📝 Monitoring {len(self.approved_groups)} approved groups")
-            logger.info(f"⏰ Bot messages will be deleted after {DELETE_DELAY} seconds")
+            if not await self.start_user_client():
+                return
+            
+            delete_worker = asyncio.create_task(self.delete_message_worker())
+            
+            logger.info("🚀 Bot is running!")
+            logger.info(f"📊 Monitoring {len(self.approved_groups)} groups")
             logger.info("👨‍💻 Created by @itz_fizzyll")
             
-            # Start keep-alive task
-            keep_alive_task = asyncio.create_task(self.keep_alive())
-            
-            # Keep both clients running
             await asyncio.gather(
-                self.user_client.run_until_disconnected(),
-                self.bot_client.run_until_disconnected(),
-                keep_alive_task,
-                return_exceptions=True
+                self.user_client.run(),
+                self.bot_client.run(),
+                delete_worker
             )
                 
         except Exception as e:
-            logger.error(f"❌ Fatal error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Fatal error: {e}")
         finally:
-            # Cleanup
-            logger.info("🔄 Disconnecting clients...")
             self.running = False
-            try:
-                if self.user_client:
-                    await self.user_client.disconnect()
-                if self.bot_client:
-                    await self.bot_client.disconnect()
-            except:
-                pass
+            if self.user_client:
+                await self.user_client.stop()
+            if self.bot_client:
+                await self.bot_client.stop()
 
 async def main():
-    """Main async function to run the bot with auto-restart"""
+    """Main function with auto-restart"""
     while True:
         try:
             deleter = TelegramMessageDeleter()
             await deleter.run()
-            
-            # If bot stops, wait 10 seconds and restart
-            logger.warning("⚠️ Bot stopped. Restarting in 10 seconds...")
+            logger.warning("Restarting in 10 seconds...")
             await asyncio.sleep(10)
-            
         except KeyboardInterrupt:
-            logger.info("⏹️ Bot stopped by user")
             break
         except Exception as e:
-            logger.error(f"❌ Critical error in main loop: {e}")
-            logger.info("Restarting in 30 seconds...")
+            logger.error(f"Error: {e}")
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    # For Heroku - simple execution with auto-restart
-    logger.info("🚀 Starting Telegram Bot Message Deleter...")
-    logger.info(f"⏰ Deletion delay set to: {DELETE_DELAY} seconds")
+    logger.info("🚀 Starting Bot Message Deleter on Heroku...")
     logger.info(f"👑 Owner ID: {OWNER_ID}")
-    logger.info("👨‍💻 Created by @itz_fizzyll")
     
     try:
-        # Run the bot with auto-restart
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("⏹️ Bot stopped by user")
+        logger.info("Bot stopped")
     except Exception as e:
-        logger.error(f"❌ Critical error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Critical error: {e}")
         sys.exit(1)
