@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-DELETE_DELAY = 135  # 135 seconds
+DELETE_DELAY = 10  # 135 seconds
 OWNER_ID = 8595518118
 APPROVED_GROUPS_FILE = 'approved_groups.json'
 
